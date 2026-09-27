@@ -1,0 +1,10 @@
+description: Pack and unpack an empty Kitfile
+kitfile: |
+  manifestVersion: 1.0.0
+  package:
+    name: test-empty
+ignored:
+  - ./model/my-model.bin
+  - ./datasets/my-dataset.bin
+  - ./code/my-code.py
+  - some-file.txt

@@ -1,0 +1,9 @@
+description: "Test dev command with directory paths (legacy functionality)"
+setup:
+  modelkits: []
+tests:
+  - name: "directory path without a Kitfile"
+    args: "./test-model"  
+    expectStartError: true
+    startErrorRegexp: "no Kitfile found in directory*"
+    expectedCacheDir: false

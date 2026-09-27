@@ -1,0 +1,349 @@
+// Copyright 2024 The KitOps Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package filesystem
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/kitops-ml/kitops/pkg/artifact"
+	"github.com/kitops-ml/kitops/pkg/lib/constants"
+	"github.com/kitops-ml/kitops/pkg/lib/constants/mediatype"
+	"github.com/kitops-ml/kitops/pkg/lib/external/s3api"
+	"github.com/kitops-ml/kitops/pkg/lib/filesystem/cache"
+	"github.com/kitops-ml/kitops/pkg/lib/filesystem/ignore"
+	"github.com/kitops-ml/kitops/pkg/lib/repo/local"
+	"github.com/kitops-ml/kitops/pkg/output"
+
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2"
+)
+
+type SaveModelOptions struct {
+	ModelFormat mediatype.ModelFormat
+	Compression mediatype.CompressionType
+	LayerFormat mediatype.Format
+}
+
+// Validate checks that the provided set of options is valid (i.e. supported by KitOps and the relevant specs)
+func (o *SaveModelOptions) Validate() error {
+	// Model-spec does not support compression on raw layers
+	if o.ModelFormat == mediatype.ModelPackFormat && o.LayerFormat == mediatype.RawFormat && o.Compression != mediatype.NoneCompression {
+		return fmt.Errorf("compression for raw layers is not supported for ModelPack")
+	}
+	return nil
+}
+
+// SaveModel saves an *artifact.Model to the provided oras.Target, compressing layers. It attempts to block
+// modelkits that include paths that leave the base context directory, allowing only subdirectories of the root
+// context to be included in the modelkit.
+func SaveModel(ctx context.Context, localRepo local.LocalRepo, kitfile *artifact.KitFile, ignore ignore.Paths, opts *SaveModelOptions) (*ocispec.Descriptor, error) {
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
+
+	layerDescs, diffIDs, err := saveKitfileLayers(ctx, localRepo, kitfile, ignore, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	configDesc, err := saveConfig(ctx, localRepo, kitfile, diffIDs, opts.ModelFormat)
+	if err != nil {
+		return nil, err
+	}
+
+	manifest, err := createManifest(configDesc, layerDescs, opts.ModelFormat)
+	if err != nil {
+		return nil, fmt.Errorf("error creating manifest: %w", err)
+	}
+
+	// If not storing a Kitfile, save the Kitfile to an annotation since it will be lost otherwise
+	if opts.ModelFormat == mediatype.ModelPackFormat {
+		kitfileBytes, err := kitfile.MarshalToJSON()
+		if err != nil {
+			return nil, err
+		}
+		if manifest.Annotations == nil {
+			manifest.Annotations = map[string]string{}
+		}
+		manifest.Annotations[constants.KitfileJsonAnnotation] = string(kitfileBytes)
+	}
+
+	manifestDesc, err := saveModelManifest(ctx, localRepo, manifest)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cache.CleanCacheDir(cache.CachePackSubdir); err != nil {
+		output.Logf(output.LogLevelWarn, "Failed to clean cache directory: %s", err)
+	}
+
+	return manifestDesc, nil
+}
+
+func saveConfig(ctx context.Context, localRepo local.LocalRepo, kitfile *artifact.KitFile, diffIDs []digest.Digest, modelFormat mediatype.ModelFormat) (ocispec.Descriptor, error) {
+	var configBytes []byte
+	var configMediaType string
+	switch modelFormat {
+	case mediatype.KitFormat:
+		configMediaType = mediatype.KitConfigMediaType.String()
+		bytes, err := kitfile.MarshalToJSON()
+		if err != nil {
+			return ocispec.DescriptorEmptyJSON, err
+		}
+		configBytes = bytes
+	case mediatype.ModelPackFormat:
+		configMediaType = mediatype.ModelPackConfigMediaType.String()
+		modelpackConfig := kitfile.ToModelPackConfig(diffIDs)
+		bytes, err := json.Marshal(modelpackConfig)
+		if err != nil {
+			return ocispec.DescriptorEmptyJSON, err
+		}
+		configBytes = bytes
+	default:
+		return ocispec.DescriptorEmptyJSON, fmt.Errorf("unrecognized model format")
+	}
+
+	desc := ocispec.Descriptor{
+		MediaType: configMediaType,
+		Digest:    digest.FromBytes(configBytes),
+		Size:      int64(len(configBytes)),
+	}
+
+	exists, err := localRepo.Exists(ctx, desc)
+	if err != nil {
+		return ocispec.DescriptorEmptyJSON, err
+	}
+	if !exists {
+		// Does not exist in storage, need to push
+		err = localRepo.Push(ctx, desc, bytes.NewReader(configBytes))
+		if err != nil {
+			return ocispec.DescriptorEmptyJSON, err
+		}
+		output.Infof("Saved configuration: %s", desc.Digest)
+	} else {
+		output.Infof("Configuration already exists in storage: %s", desc.Digest)
+	}
+
+	return desc, nil
+}
+
+func saveKitfileLayers(ctx context.Context, localRepo local.LocalRepo, kitfile *artifact.KitFile, ignore ignore.Paths, opts *SaveModelOptions) (layers []ocispec.Descriptor, diffIDs []digest.Digest, err error) {
+	toVerifyRemote := map[string]s3api.S3ObjectReference{}
+	if kitfile.Model != nil {
+		if kitfile.Model.Path != "" && !artifact.IsModelKitReference(kitfile.Model.Path) {
+			mediaType := mediatype.New(opts.ModelFormat, mediatype.ModelBaseType, opts.LayerFormat, opts.Compression)
+			layer, layerInfo, err := saveContentLayer(ctx, localRepo, kitfile.Model.Path, mediaType, ignore)
+			if err != nil {
+				return nil, nil, err
+			}
+			layers = append(layers, layer)
+			diffIDs = append(diffIDs, digest.Digest(layerInfo.DiffId))
+			kitfile.Model.LayerInfo = layerInfo
+		}
+		for idx, part := range kitfile.Model.Parts {
+			mediaType := mediatype.New(opts.ModelFormat, mediatype.ModelPartBaseType, opts.LayerFormat, opts.Compression)
+			layer, layerInfo, err := saveContentLayer(ctx, localRepo, part.Path, mediaType, ignore)
+			if err != nil {
+				return nil, nil, err
+			}
+			layers = append(layers, layer)
+			diffIDs = append(diffIDs, digest.Digest(layerInfo.DiffId))
+			kitfile.Model.Parts[idx].LayerInfo = layerInfo
+		}
+	}
+	for idx, code := range kitfile.Code {
+		mediaType := mediatype.New(opts.ModelFormat, mediatype.CodeBaseType, opts.LayerFormat, opts.Compression)
+		layer, layerInfo, err := saveContentLayer(ctx, localRepo, code.Path, mediaType, ignore)
+		if err != nil {
+			return nil, nil, err
+		}
+		layers = append(layers, layer)
+		diffIDs = append(diffIDs, digest.Digest(layerInfo.DiffId))
+		kitfile.Code[idx].LayerInfo = layerInfo
+	}
+	for idx, dataset := range kitfile.DataSets {
+		// First check if dataset is stored remotely
+		if dataset.RemotePath != "" {
+			if artifact.IsModelKitReference(dataset.RemotePath) {
+				continue
+			}
+			ref, err := s3api.ParseS3ObjectReference(dataset.RemotePath, dataset.RemoteHash)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to parse S3 object reference for dataset %s: %w", dataset.Path, err)
+			}
+			toVerifyRemote[dataset.Path] = *ref
+			continue
+		}
+
+		// Otherwise, pack a locally-stored dataset
+		mediaType := mediatype.New(opts.ModelFormat, mediatype.DatasetBaseType, opts.LayerFormat, opts.Compression)
+		layer, layerInfo, err := saveContentLayer(ctx, localRepo, dataset.Path, mediaType, ignore)
+		if err != nil {
+			return nil, nil, err
+		}
+		layers = append(layers, layer)
+		diffIDs = append(diffIDs, digest.Digest(layerInfo.DiffId))
+		kitfile.DataSets[idx].LayerInfo = layerInfo
+	}
+	for idx, docs := range kitfile.Docs {
+		mediaType := mediatype.New(opts.ModelFormat, mediatype.DocsBaseType, opts.LayerFormat, opts.Compression)
+		layer, layerInfo, err := saveContentLayer(ctx, localRepo, docs.Path, mediaType, ignore)
+		if err != nil {
+			return nil, nil, err
+		}
+		layers = append(layers, layer)
+		diffIDs = append(diffIDs, digest.Digest(layerInfo.DiffId))
+		kitfile.Docs[idx].LayerInfo = layerInfo
+	}
+	for idx, prompt := range kitfile.Prompts {
+		// Prompt layers are saved as `code` layers with an annotation to distinguish them
+		mediaType := mediatype.New(opts.ModelFormat, mediatype.CodeBaseType, opts.LayerFormat, opts.Compression)
+		layer, layerInfo, err := saveContentLayer(ctx, localRepo, prompt.Path, mediaType, ignore)
+		if err != nil {
+			return nil, nil, err
+		}
+		if layer.Annotations == nil {
+			layer.Annotations = map[string]string{}
+		}
+		layer.Annotations[constants.LayerSubtypeAnnotation] = constants.LayerSubtypePrompt
+		layers = append(layers, layer)
+		diffIDs = append(diffIDs, digest.Digest(layerInfo.DiffId))
+		kitfile.Prompts[idx].LayerInfo = layerInfo
+	}
+	if len(kitfile.MCPServers) > 0 && opts.ModelFormat == mediatype.ModelPackFormat {
+		// The mcpb media type is KitOps-local; it is not defined for the ModelPack format
+		return nil, nil, fmt.Errorf("mcpServers are not supported when packing in modelpack format")
+	}
+	for idx, server := range kitfile.MCPServers {
+		// MCP Bundles are stored as raw, uncompressed layers so that the .mcpb ZIP archive
+		// round-trips byte-for-byte. Validate it is a well-formed bundle before packing.
+		if err := ValidateMCPB(server.Path); err != nil {
+			return nil, nil, fmt.Errorf("invalid MCP bundle for mcpServer %s: %w", server.Name, err)
+		}
+		mediaType := mediatype.New(mediatype.KitFormat, mediatype.MCPBBaseType, mediatype.RawFormat, mediatype.NoneCompression)
+		layer, layerInfo, err := saveContentLayer(ctx, localRepo, server.Path, mediaType, ignore)
+		if err != nil {
+			return nil, nil, err
+		}
+		layers = append(layers, layer)
+		diffIDs = append(diffIDs, digest.Digest(layerInfo.DiffId))
+		kitfile.MCPServers[idx].LayerInfo = layerInfo
+	}
+
+	if len(toVerifyRemote) > 0 {
+		client, err := s3api.SetUpClient(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		for path, toVerify := range toVerifyRemote {
+			output.Debugf("Verifying S3 object: Bucket: %s, Key: %s", toVerify.Bucket, toVerify.Key)
+			if err := s3api.VerifyObjectExists(ctx, client, &toVerify); err != nil {
+				return nil, nil, fmt.Errorf("failed to verify remote object for %s: %w", path, err)
+			}
+			output.Infof("Verified remote S3 dataset for path %s", path)
+		}
+	}
+
+	return layers, diffIDs, nil
+}
+
+func saveContentLayer(ctx context.Context, localRepo local.LocalRepo, path string, mediaType mediatype.MediaType, ignore ignore.Paths) (ocispec.Descriptor, *artifact.LayerInfo, error) {
+	switch mediaType.Format() {
+	case mediatype.TarFormat:
+		return saveContentLayerAsTar(ctx, localRepo, path, mediaType, ignore)
+	case mediatype.RawFormat:
+		return saveContentLayerAsRaw(ctx, localRepo, path, mediaType, ignore)
+	default:
+		return ocispec.DescriptorEmptyJSON, nil, fmt.Errorf("unknown layer format")
+	}
+}
+
+func saveModelManifest(ctx context.Context, store oras.Target, manifest ocispec.Manifest) (*ocispec.Descriptor, error) {
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return nil, err
+	}
+	// Push the manifest to the store
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifestBytes),
+		Size:      int64(len(manifestBytes)),
+	}
+
+	if exists, err := store.Exists(ctx, desc); err != nil {
+		return nil, err
+	} else if !exists {
+		// Does not exist in storage, need to push
+		err = store.Push(ctx, desc, bytes.NewReader(manifestBytes))
+		if err != nil {
+			return nil, err
+		}
+		output.Infof("Saved manifest to storage: %s", desc.Digest)
+	} else {
+		output.Infof("Manifest already exists in storage: %s", desc.Digest)
+	}
+	return &desc, nil
+}
+
+func createManifest(configDesc ocispec.Descriptor, layerDescs []ocispec.Descriptor, modelFormat mediatype.ModelFormat) (ocispec.Manifest, error) {
+	var manifest ocispec.Manifest
+	switch modelFormat {
+	case mediatype.KitFormat:
+		manifest = ocispec.Manifest{
+			Versioned:    specs.Versioned{SchemaVersion: 2},
+			MediaType:    ocispec.MediaTypeImageManifest,
+			ArtifactType: mediatype.ArtifactTypeKitManifest,
+			Config:       configDesc,
+			Layers:       layerDescs,
+		}
+	case mediatype.ModelPackFormat:
+		manifest = ocispec.Manifest{
+			Versioned:    specs.Versioned{SchemaVersion: 2},
+			MediaType:    ocispec.MediaTypeImageManifest,
+			ArtifactType: mediatype.ArtifactTypeModelManifest,
+			Config:       configDesc,
+			Layers:       layerDescs,
+		}
+	default:
+		return ocispec.Manifest{}, fmt.Errorf("invalid Model format")
+	}
+
+	// Global annotations
+	if manifest.Annotations == nil {
+		manifest.Annotations = map[string]string{}
+	}
+	manifest.Annotations[constants.CliVersionAnnotation] = constants.Version
+	createdTime := time.Now().UTC()
+	if epochStr := os.Getenv("SOURCE_DATE_EPOCH"); epochStr != "" {
+		epochSec, err := strconv.ParseInt(epochStr, 10, 64)
+		if err != nil {
+			return ocispec.Manifest{}, fmt.Errorf("invalid SOURCE_DATE_EPOCH %q: %w", epochStr, err)
+		}
+		createdTime = time.Unix(epochSec, 0).UTC()
+	}
+	manifest.Annotations[ocispec.AnnotationCreated] = createdTime.Format(time.RFC3339)
+
+	return manifest, nil
+}
